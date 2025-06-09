@@ -5,6 +5,7 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
 #include "proc.h"
 
 /*
@@ -179,15 +180,17 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
     if((pte = walk(pagetable, a, 0)) == 0)
-      panic("uvmunmap: walk");
+      continue;
     if((*pte & PTE_V) == 0)
-      panic("uvmunmap: not mapped");
+      continue;
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
-    if(do_free){
-      uint64 pa = PTE2PA(*pte);
-      kfree((void*)pa);
+
+    if(do_free && (*pte & PTE_S) == 0){
+        uint64 pa = PTE2PA(*pte);
+        kfree((void*)pa);
     }
+
     *pte = 0;
   }
 }
@@ -441,16 +444,22 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 
 uint64
 map_shared_pages(struct proc* src_proc, struct proc* dst_proc, uint64 src_va, uint64 size) {
-  if (size == 0)
+  if (src_proc == 0 || dst_proc == 0 || size == 0)
     return 0;
 
   uint64 src_start = PGROUNDDOWN(src_va); // First page-aligned address before or at src_va
   uint64 src_end = PGROUNDUP(src_va + size);// First page-aligned address after 
   uint64 dst_va = PGROUNDUP(dst_proc->sz);  // First free page-aligned address in dst_proc
 
+  acquire(&src_proc->lock);
+  acquire(&dst_proc->lock);
+
   for (uint64 va = src_start, dva = dst_va; va < src_end; va += PGSIZE, dva += PGSIZE) {
     pte_t *pte = walk(src_proc->pagetable, va, 0); 
     if (pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0) { 
+      printf("walk returned null for va=%p\n", va);
+      release(&dst_proc->lock);
+      release(&src_proc->lock);
       return 0;// Page not valid or not accessible by user
     }
 
@@ -458,26 +467,33 @@ map_shared_pages(struct proc* src_proc, struct proc* dst_proc, uint64 src_va, ui
     int flags = PTE_FLAGS(*pte) | PTE_S; // Keep same flags and mark as shared
 
     if (mappages(dst_proc->pagetable, dva, PGSIZE, pa, flags) < 0) {
+      release(&dst_proc->lock);
+      release(&src_proc->lock);
       return 0;
     }
   }
 
   // Update destination process size to reflect new mapped pages
-  dst_proc->sz = PGROUNDUP(dst_proc->sz + (src_end - src_start));
+  dst_proc->sz = dst_va + (src_end - src_start);
+  release(&dst_proc->lock);
+  release(&src_proc->lock);
 
   uint64 offset = src_va - src_start;  // Calculate offset within first page 
   return dst_va + offset;
 }
 
 uint64
-unmap_shared_pages(struct proc *p, uint64 addr, int size)
+unmap_shared_pages(struct proc* p, uint64 addr, int size)
 {
   if (size <= 0 || addr % PGSIZE != 0)
     return -1;
+
+  acquire(&p->lock);
 
   for (uint64 a = addr; a < addr + size; a += PGSIZE) {
     uvmunmap(p->pagetable, a, 1, 0);  // unmap 1 page, don't free physical memory
   }
 
+  release(&p->lock);
   return 0;
 }
